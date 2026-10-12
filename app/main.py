@@ -40,6 +40,20 @@ async def _error_validacion(_: Request, exc: RequestValidationError) -> JSONResp
     )
 
 
+@app.exception_handler(Exception)
+async def _error_inesperado(_: Request, exc: Exception) -> JSONResponse:
+    logging.getLogger(__name__).exception("Error inesperado analizando el recibo", exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": {
+                "codigo": "ERROR_INTERNO",
+                "mensaje": "Ocurrió un error procesando la foto. Intenta con otra foto o más tarde.",
+            }
+        },
+    )
+
+
 @app.get("/health", tags=["estado"])
 def health() -> dict:
     settings = get_settings()
