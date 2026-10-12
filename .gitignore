@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+
+# Fotos de recibos reales (datos personales)
+muestras/
+*.jpg
+*.jpeg
+*.png
