@@ -152,7 +152,8 @@ def _angulo_inclinacion(gris: np.ndarray) -> float:
     if lineas is None:
         return 0.0
     angulos = []
-    for x1, y1, x2, y2 in lineas[:, 0]:
+    # Según la versión de OpenCV el arreglo viene como (N, 1, 4) o (N, 4)
+    for x1, y1, x2, y2 in np.asarray(lineas).reshape(-1, 4):
         ang = np.degrees(np.arctan2(y2 - y1, x2 - x1))
         if abs(ang) < 15:
             angulos.append(ang)
@@ -191,7 +192,11 @@ def preprocesar(contenido: bytes) -> ImagenProcesada:
     original = _rotar(original, rotacion)
 
     if esquinas is None:
-        angulo = _angulo_inclinacion(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        try:
+            angulo = _angulo_inclinacion(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        except Exception:  # noqa: BLE001 - enderezar es opcional: si falla se sigue sin hacerlo
+            logger.warning("No se pudo estimar la inclinación", exc_info=True)
+            angulo = 0.0
         if 0.3 < abs(angulo) < 15:
             img = _enderezar(img, angulo)
 
