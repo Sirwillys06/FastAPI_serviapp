@@ -3,5 +3,3 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
-# Fotos reales de recibos y valores esperados: contienen datos personales.
-samples/
