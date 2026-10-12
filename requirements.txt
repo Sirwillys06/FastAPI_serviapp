@@ -1,2 +1,13 @@
 fastapi>=0.115,<1.0
 uvicorn>=0.34,<1.0
+python-multipart>=0.0.20,<1.0
+
+
+#procesamiento de imagenes
+opencv-python-headless>=4.11,<5.0 #representar la imagen como una matriz de pixeles.
+numpy>=2.2,<3.0 #representar la imagen como una matriz de pixeles.
+Pillow>=11.1,<13.0 #validar la imagen y corregir su orientación.
+
+
+#procesamiento de texto
+pytesseract>=0.3.13,<0.4 #sirve para reconocer extraer texto de la imagen.
