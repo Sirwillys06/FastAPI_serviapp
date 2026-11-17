@@ -9,3 +9,6 @@ muestras/
 *.jpg
 *.jpeg
 *.png
+.venv
+
+.venv/
