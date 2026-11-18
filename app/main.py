@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api.routes import recibos
+from .api.routes import predicciones, recibos
 from .core.config import get_settings
 from .schemas.recibo import ResultadoAnalisis
 
@@ -61,3 +61,4 @@ def health() -> dict:
 
 
 app.include_router(recibos.router)
+app.include_router(predicciones.router)

@@ -56,6 +56,9 @@ class Settings:
     api_key: str | None
     max_upload_bytes: int
     ocr_lang: str
+    spring_boot_url: str
+    ml_internal_api_key: str | None
+    spring_timeout_seconds: float
 
 
 @lru_cache
@@ -66,4 +69,7 @@ def get_settings() -> Settings:
         api_key=os.getenv("SERVIAPP_API_KEY") or None,
         max_upload_bytes=int(float(os.getenv("MAX_UPLOAD_MB", "15")) * 1024 * 1024),
         ocr_lang=os.getenv("OCR_LANG", "spa"),
+        spring_boot_url=os.getenv("SPRING_BOOT_URL", "http://localhost:8080").rstrip("/"),
+        ml_internal_api_key=os.getenv("ML_INTERNAL_API_KEY") or None,
+        spring_timeout_seconds=float(os.getenv("SPRING_TIMEOUT_SECONDS", "15")),
     )
