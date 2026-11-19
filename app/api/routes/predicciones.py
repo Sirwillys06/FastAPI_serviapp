@@ -1,10 +1,11 @@
-"""Predicción de consumo a partir del perfil y recibos guardados en Spring."""
+"""Predicción de consumo a partir del modelo oficial ServiApp_LSTM y datos de Spring Boot."""
 
 from __future__ import annotations
 
 import asyncio
 from functools import lru_cache
 from pathlib import Path
+import unicodedata
 
 import httpx
 import joblib
@@ -17,9 +18,30 @@ from ...core.config import get_settings
 router = APIRouter(prefix="/api/predicciones", tags=["predicciones"])
 _ARTIFACTS = Path(__file__).resolve().parents[2] / "ml_artifacts"
 
+# Mapeo de unidades oficiales por servicio
+UNIDADES_SERVICIO = {
+    "AGUA": "m³",
+    "ENERGIA": "kWh",
+    "GAS": "m³",
+}
+
+# Codificación One-Hot oficial
+ONE_HOT_SERVICIO = {
+    "AGUA": [1.0, 0.0, 0.0],
+    "ENERGIA": [0.0, 1.0, 0.0],
+    "GAS": [0.0, 0.0, 1.0],
+}
+
 
 class SolicitudPrediccion(BaseModel):
     usuarioId: str = Field(min_length=1)
+
+
+class SolicitudPrediccionDirecta(BaseModel):
+    servicio: str
+    consumos_anteriores: list[float] = Field(min_length=5, max_length=5)
+    estrato: int = Field(ge=1, le=6)
+    habitantes: int = Field(ge=1)
 
 
 class DatosUsuario(BaseModel):
@@ -43,25 +65,44 @@ class HistoricoSpring(BaseModel):
     historialRecibos: list[ReciboHistorico]
 
 
+def normalizar_servicio(servicio: str) -> str:
+    """Normaliza el nombre del servicio eliminando tildes y espacios."""
+    if not servicio:
+        return ""
+    texto = unicodedata.normalize("NFD", servicio)
+    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    return texto.strip().upper()
+
+
 @lru_cache
-def _cargar_modelo(servicio: str):
-    """Carga una vez los artefactos exportados desde el notebook de Colab."""
+def _cargar_modelo_oficial():
+    """Carga en memoria el modelo LSTM oficial y sus escaladores joblib."""
     try:
         import tensorflow as tf
     except ImportError as exc:
         raise RuntimeError("TensorFlow no está instalado en FastAPI") from exc
+
+    modelo_path = _ARTIFACTS / "modelo_lstm_mejor.keras"
+    escaladores_consumo_path = _ARTIFACTS / "escaladores_consumo.joblib"
+    escalador_contexto_path = _ARTIFACTS / "escalador_contexto.joblib"
+
+    if not modelo_path.exists():
+        raise RuntimeError(f"Falta el modelo oficial: {modelo_path.name}")
+    if not escaladores_consumo_path.exists():
+        raise RuntimeError(f"Falta el escalador de consumo: {escaladores_consumo_path.name}")
+    if not escalador_contexto_path.exists():
+        raise RuntimeError(f"Falta el escalador de contexto: {escalador_contexto_path.name}")
+
     try:
-        modelo = tf.keras.models.load_model(_ARTIFACTS / f"modelo_{servicio}.keras")
-        return (
-            modelo,
-            joblib.load(_ARTIFACTS / f"scaler_x_{servicio}.pkl"),
-            joblib.load(_ARTIFACTS / f"scaler_y_{servicio}.pkl"),
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"Falta el artefacto del modelo para {servicio}") from exc
+        modelo = tf.keras.models.load_model(modelo_path)
+        escaladores_consumo = joblib.load(escaladores_consumo_path)
+        escalador_contexto = joblib.load(escalador_contexto_path)
+        return modelo, escaladores_consumo, escalador_contexto
+    except Exception as exc:
+        raise RuntimeError(f"Error cargando artefactos del modelo oficial: {exc}") from exc
 
 
-async def _obtener_historico(usuario_id: str, servicio: str, meses: int) -> HistoricoSpring:
+async def _obtener_historico(usuario_id: str, servicio: str, meses: int = 5) -> HistoricoSpring:
     settings = get_settings()
     if not settings.ml_internal_api_key:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ML_INTERNAL_API_KEY no está configurada")
@@ -74,6 +115,7 @@ async def _obtener_historico(usuario_id: str, servicio: str, meses: int) -> Hist
             )
     except httpx.RequestError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "No fue posible conectar con Spring Boot") from exc
+
     if respuesta.is_error:
         try:
             detalle = respuesta.json().get("detail", respuesta.text)
@@ -89,53 +131,142 @@ def _periodo_siguiente(periodo: str) -> str:
         if mes == 12:
             return f"{anio + 1}-01"
         return f"{anio}-{mes + 1:02d}"
-    except ValueError as exc:
+    except Exception as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Periodo de recibo inválido") from exc
 
 
-def _predecir(historial: HistoricoSpring, servicio: str) -> dict:
+def ejecutar_inferencia_lstm(servicio: str, consumos: list[float], estrato: int, habitantes: int) -> float:
+    """Aplica el pipeline oficial del modelo LSTM sobre los 5 consumos cronológicos y contexto."""
+    srv = normalizar_servicio(servicio)
+    if srv not in ONE_HOT_SERVICIO:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Servicio inválido: {servicio}")
+
+    if len(consumos) != 5:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Se requieren exactamente 5 consumos (recibidos {len(consumos)})")
+
+    if any(c < 0 or not np.isfinite(c) for c in consumos):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Los consumos deben ser valores finitos no negativos")
+
+    if not (1 <= estrato <= 6):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Estrato inválido: {estrato}. Debe estar entre 1 y 6")
+
+    if habitantes <= 0:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Habitantes inválido: {habitantes}. Debe ser mayor a 0")
+
+    modelo, escaladores_consumo, escalador_contexto = _cargar_modelo_oficial()
+
+    scaler_c = escaladores_consumo[srv]
+    # Escalar consumos (5, 1) y luego dar forma de tensor (1, 5, 1)
+    X_hist = scaler_c.transform(np.array(consumos, dtype=float).reshape(-1, 1)).reshape(1, 5, 1)
+
+    # Escalar contexto (estrato, habitantes) -> shape (1, 2)
+    X_ctx = escalador_contexto.transform(np.array([[estrato, habitantes]], dtype=float))
+
+    # One-hot del servicio -> shape (1, 3)
+    X_srv = np.array([ONE_HOT_SERVICIO[srv]], dtype=float)
+
+    # Predicción
+    pred_scaled = modelo.predict({"historial": X_hist, "contexto": X_ctx, "servicio": X_srv}, verbose=0)
+
+    # Inverse transform
+    pred = scaler_c.inverse_transform(pred_scaled)
+    consumo_estimado = max(0.0, round(float(pred[0][0]), 2))
+    return consumo_estimado
+
+
+def _predecir_con_historial_spring(historial: HistoricoSpring, servicio_nom: str) -> dict:
     consumos = [r.consumo for r in historial.historialRecibos]
-    if len(consumos) < 3:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Se necesitan al menos tres recibos")
+    if len(consumos) != 5:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"El modelo oficial LSTM requiere exactamente 5 meses de consumo (disponibles {len(consumos)})",
+        )
+
+    srv = normalizar_servicio(servicio_nom)
+    datos = historial.datosUsuario
+    consumo_estimado = ejecutar_inferencia_lstm(srv, consumos, datos.estrato, datos.habitantes)
+
     ultimo = historial.historialRecibos[-1]
     periodo_estimado = _periodo_siguiente(ultimo.periodo)
-    mes_objetivo = int(periodo_estimado[-2:])
-    datos = historial.datosUsuario
-    entrada = np.array([[
-        datos.estrato,
-        datos.habitantes,
-        1 if datos.tipoPredio.upper() == "CASA" else 0,
-        np.sin(2 * np.pi * mes_objetivo / 12.0),
-        np.cos(2 * np.pi * mes_objetivo / 12.0),
-        *consumos[-3:],
-    ]], dtype=float)
-    modelo, scaler_x, scaler_y = _cargar_modelo(servicio)
-    prediccion_escalada = modelo.predict(scaler_x.transform(entrada), verbose=0)
-    consumo = max(0.0, round(float(scaler_y.inverse_transform(prediccion_escalada)[0][0]), 1))
+    unidad = UNIDADES_SERVICIO.get(srv, ultimo.unidad or "unidad")
+
     return {
         "usuarioId": historial.usuarioId,
-        "servicio": servicio.upper(),
+        "servicio": srv,
         "ventanaMesesSolicitada": historial.cantidadMesesSolicitados,
-        "ventanaUsadaPorModelo": 3,
+        "ventanaUsadaPorModelo": 5,
         "prediccionSiguienteMes": {
             "periodoEstimado": periodo_estimado,
-            "consumoEstimado": consumo,
-            "unidad": ultimo.unidad,
+            "consumoEstimado": consumo_estimado,
+            "unidad": unidad,
         },
         "historicoAnalizado": [r.model_dump(include={"periodo", "consumo"}) for r in historial.historialRecibos],
-        "metadatosModelo": {"versionModelo": f"{servicio}_tensorflow_v1", "algoritmo": "TensorFlow Sequential"},
+        "metadatosModelo": {
+            "versionModelo": "ServiApp_LSTM_oficial",
+            "algoritmo": "LSTM Red Neuronal Recurrente",
+        },
     }
 
 
-@router.post("/{servicio}/meses{meses}")
-async def predecir(servicio: str, meses: int, solicitud: SolicitudPrediccion) -> dict:
-    servicio = servicio.lower()
-    if servicio not in {"energia", "agua"}:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "servicio debe ser energia o agua")
-    if meses not in {3, 5}:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "meses debe ser 3 o 5")
-    historico = await _obtener_historico(solicitud.usuarioId, servicio, meses)
+# =====================================================================
+# Endpoints de la API
+# =====================================================================
+
+@router.post("/predecir")
+async def predecir_directo(solicitud: SolicitudPrediccionDirecta) -> dict:
+    """Endpoint directo según contrato oficial del documento (utilizado por Spring Boot u otros clientes)."""
+    srv = normalizar_servicio(solicitud.servicio)
+    if srv not in ONE_HOT_SERVICIO:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Servicio inválido: {solicitud.servicio}")
+
     try:
-        return await asyncio.to_thread(_predecir, historico, servicio)
+        consumo_estimado = await asyncio.to_thread(
+            ejecutar_inferencia_lstm,
+            srv,
+            solicitud.consumos_anteriores,
+            solicitud.estrato,
+            solicitud.habitantes,
+        )
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    return {
+        "servicio": srv,
+        "consumo_estimado": consumo_estimado,
+        "unidad": UNIDADES_SERVICIO.get(srv, "unidad"),
+    }
+
+
+@router.post("/{servicio}")
+async def predecir_por_usuario(servicio: str, solicitud: SolicitudPrediccion) -> dict:
+    """Ruta general por usuario: obtiene los 5 meses de Spring Boot y genera la predicción LSTM."""
+    srv = normalizar_servicio(servicio)
+    if srv not in ONE_HOT_SERVICIO:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "servicio debe ser ENERGIA, AGUA o GAS")
+
+    historico = await _obtener_historico(solicitud.usuarioId, srv, meses=5)
+    try:
+        return await asyncio.to_thread(_predecir_con_historial_spring, historico, srv)
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+
+@router.post("/{servicio}/meses{meses}")
+async def predecir_por_usuario_con_meses(servicio: str, meses: int, solicitud: SolicitudPrediccion) -> dict:
+    """Ruta retrocompatible con la prueba anterior. Requiere meses=5 para el modelo oficial LSTM."""
+    srv = normalizar_servicio(servicio)
+    if srv not in ONE_HOT_SERVICIO:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "servicio debe ser ENERGIA, AGUA o GAS")
+
+    if meses != 5:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"El modelo oficial LSTM de ServiApp opera exclusivamente con ventana de 5 meses (se solicitó meses={meses}).",
+        )
+
+    historico = await _obtener_historico(solicitud.usuarioId, srv, meses=5)
+    try:
+        return await asyncio.to_thread(_predecir_con_historial_spring, historico, srv)
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
