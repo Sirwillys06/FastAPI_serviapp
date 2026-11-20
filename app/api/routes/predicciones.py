@@ -1,4 +1,4 @@
-"""Predicción de consumo a partir del modelo oficial ServiApp_LSTM y datos de Spring Boot."""
+"""Predicción de consumo a partir del modelo oficial ServiApp_LSTM con fiabilidad y datos de Spring Boot."""
 
 from __future__ import annotations
 
@@ -30,6 +30,13 @@ ONE_HOT_SERVICIO = {
     "AGUA": [1.0, 0.0, 0.0],
     "ENERGIA": [0.0, 1.0, 0.0],
     "GAS": [0.0, 0.0, 1.0],
+}
+
+# Fiabilidad del modelo por servicio obtenida en la fase de evaluación (R² del conjunto de prueba)
+FIABILIDAD_MODELO = {
+    "AGUA": 95.38,
+    "ENERGIA": 90.89,
+    "GAS": 89.38,
 }
 
 
@@ -94,7 +101,7 @@ def _cargar_modelo_oficial():
         raise RuntimeError(f"Falta el escalador de contexto: {escalador_contexto_path.name}")
 
     try:
-        modelo = tf.keras.models.load_model(modelo_path)
+        modelo = tf.keras.models.load_model(modelo_path, compile=False)
         escaladores_consumo = joblib.load(escaladores_consumo_path)
         escalador_contexto = joblib.load(escalador_contexto_path)
         return modelo, escaladores_consumo, escalador_contexto
@@ -135,7 +142,12 @@ def _periodo_siguiente(periodo: str) -> str:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Periodo de recibo inválido") from exc
 
 
-def ejecutar_inferencia_lstm(servicio: str, consumos: list[float], estrato: int, habitantes: int) -> float:
+def ejecutar_inferencia_lstm(
+    servicio: str,
+    consumos: list[float],
+    estrato: int,
+    habitantes: int,
+) -> tuple[float, float]:
     """Aplica el pipeline oficial del modelo LSTM sobre los 5 consumos cronológicos y contexto."""
     srv = normalizar_servicio(servicio)
     if srv not in ONE_HOT_SERVICIO:
@@ -157,13 +169,18 @@ def ejecutar_inferencia_lstm(servicio: str, consumos: list[float], estrato: int,
 
     scaler_c = escaladores_consumo[srv]
     # Escalar consumos (5, 1) y luego dar forma de tensor (1, 5, 1)
-    X_hist = scaler_c.transform(np.array(consumos, dtype=float).reshape(-1, 1)).reshape(1, 5, 1)
+    X_hist = scaler_c.transform(np.array(consumos, dtype=float).reshape(-1, 1)).astype(np.float32).reshape(1, 5, 1)
 
-    # Escalar contexto (estrato, habitantes) -> shape (1, 2)
-    X_ctx = escalador_contexto.transform(np.array([[estrato, habitantes]], dtype=float))
+    # Escalar contexto (estrato, habitantes) sin requerir pandas -> shape (1, 2)
+    # StandardScaler aplica: (X - mean_) / scale_
+    ctx_vals = np.array([[float(estrato), float(habitantes)]], dtype=np.float32)
+    if hasattr(escalador_contexto, "mean_") and hasattr(escalador_contexto, "scale_"):
+        X_ctx = (ctx_vals - escalador_contexto.mean_) / escalador_contexto.scale_
+    else:
+        X_ctx = escalador_contexto.transform(ctx_vals).astype(np.float32)
 
     # One-hot del servicio -> shape (1, 3)
-    X_srv = np.array([ONE_HOT_SERVICIO[srv]], dtype=float)
+    X_srv = np.array([ONE_HOT_SERVICIO[srv]], dtype=np.float32)
 
     # Predicción
     pred_scaled = modelo.predict({"historial": X_hist, "contexto": X_ctx, "servicio": X_srv}, verbose=0)
@@ -171,7 +188,9 @@ def ejecutar_inferencia_lstm(servicio: str, consumos: list[float], estrato: int,
     # Inverse transform
     pred = scaler_c.inverse_transform(pred_scaled)
     consumo_estimado = max(0.0, round(float(pred[0][0]), 2))
-    return consumo_estimado
+    porcentaje_fiabilidad = FIABILIDAD_MODELO.get(srv, 90.0)
+
+    return consumo_estimado, porcentaje_fiabilidad
 
 
 def _predecir_con_historial_spring(historial: HistoricoSpring, servicio_nom: str) -> dict:
@@ -184,7 +203,12 @@ def _predecir_con_historial_spring(historial: HistoricoSpring, servicio_nom: str
 
     srv = normalizar_servicio(servicio_nom)
     datos = historial.datosUsuario
-    consumo_estimado = ejecutar_inferencia_lstm(srv, consumos, datos.estrato, datos.habitantes)
+    consumo_estimado, fiabilidad_pct = ejecutar_inferencia_lstm(
+        srv,
+        consumos,
+        datos.estrato,
+        datos.habitantes,
+    )
 
     ultimo = historial.historialRecibos[-1]
     periodo_estimado = _periodo_siguiente(ultimo.periodo)
@@ -200,9 +224,10 @@ def _predecir_con_historial_spring(historial: HistoricoSpring, servicio_nom: str
             "consumoEstimado": consumo_estimado,
             "unidad": unidad,
         },
+        "porcentajeFiabilidad": fiabilidad_pct,
         "historicoAnalizado": [r.model_dump(include={"periodo", "consumo"}) for r in historial.historialRecibos],
         "metadatosModelo": {
-            "versionModelo": "ServiApp_LSTM_oficial",
+            "versionModelo": "ServiApp_LSTM_Final",
             "algoritmo": "LSTM Red Neuronal Recurrente",
         },
     }
@@ -214,13 +239,13 @@ def _predecir_con_historial_spring(historial: HistoricoSpring, servicio_nom: str
 
 @router.post("/predecir")
 async def predecir_directo(solicitud: SolicitudPrediccionDirecta) -> dict:
-    """Endpoint directo según contrato oficial del documento (utilizado por Spring Boot u otros clientes)."""
+    """Endpoint directo según contrato oficial del documento."""
     srv = normalizar_servicio(solicitud.servicio)
     if srv not in ONE_HOT_SERVICIO:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"Servicio inválido: {solicitud.servicio}")
 
     try:
-        consumo_estimado = await asyncio.to_thread(
+        consumo_estimado, fiabilidad_pct = await asyncio.to_thread(
             ejecutar_inferencia_lstm,
             srv,
             solicitud.consumos_anteriores,
@@ -234,6 +259,7 @@ async def predecir_directo(solicitud: SolicitudPrediccionDirecta) -> dict:
         "servicio": srv,
         "consumo_estimado": consumo_estimado,
         "unidad": UNIDADES_SERVICIO.get(srv, "unidad"),
+        "porcentajeFiabilidad": fiabilidad_pct,
     }
 
 
@@ -269,4 +295,6 @@ async def predecir_por_usuario_con_meses(servicio: str, meses: int, solicitud: S
         return await asyncio.to_thread(_predecir_con_historial_spring, historico, srv)
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+
 
